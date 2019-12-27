@@ -1,0 +1,930 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+
+  ServerDownloadUrl:
+    Type: String
+    Default: https://launcher.mojang.com/v1/objects/3dc3d84a581f14691199cf6831b71ed1296a9fdf/server.jar
+  
+  ImageId: 
+    Type: 'AWS::EC2::Image::Id'
+    Description: Choose an Amazon Linux 2 image
+    Default: ami-0b898040803850657
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+  
+  MOTD: 
+    Type: String
+
+  DuckDnsSubDomain:
+    Type: String
+
+  DuckDnsToken:
+    Type: String
+
+  Seed:
+    Type: String
+
+  LevelType:
+    Type: String
+    Default: Default
+
+  SpotPrice:
+    Type: String
+    Default: 0.10
+
+  KeyPair:
+    Type: AWS::EC2::KeyPair::KeyName
+
+  AdminPassword:
+    Type: String
+
+Outputs:
+  Url:
+    Value: !Sub https://${api}.execute-api.${AWS::Region}.amazonaws.com/${stage}
+
+Resources:
+
+  bucket:
+    Type: AWS::S3::Bucket
+
+  vpc: 
+    Type: AWS::EC2::VPC
+    Properties:
+        CidrBlock: 10.0.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+        InstanceTenancy: default
+        Tags:
+          - Key: Name
+            Value: !Ref AWS::StackName
+    
+  gateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - 
+          Key: Name
+          Value: !Ref AWS::StackName
+
+  gatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref gateway
+      VpcId: !Ref vpc
+
+  publicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - 
+          Key: Name
+          Value: !Ref AWS::StackName
+
+  publicInternetRoute:
+      Type: 'AWS::EC2::Route'
+      Properties:
+          RouteTableId: !Ref publicRouteTable
+          DestinationCidrBlock: 0.0.0.0/0
+          GatewayId: !Ref gateway
+      DependsOn: gateway
+
+  subnet:
+    Type: 'AWS::EC2::Subnet'
+    Properties:
+      VpcId: !Ref vpc
+      CidrBlock: 10.0.0.0/24
+      Tags:
+        - 
+          Key: Name
+          Value: !Ref AWS::StackName
+
+  subnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+        RouteTableId: !Ref publicRouteTable
+        SubnetId: !Ref subnet
+
+  acl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - 
+          Key: Name
+          Value: !Ref AWS::StackName
+
+  aclIn:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref acl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: 0.0.0.0/0
+
+  aclOut:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref acl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: 0.0.0.0/0
+
+  aclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+        NetworkAclId: !Ref acl
+        SubnetId: !Ref subnet
+
+  securityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: minecraft server
+      VpcId: !Ref vpc
+      SecurityGroupIngress:
+        - Description: ssh
+          CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+        - Description: minecraft
+          CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 25565
+          ToPort: 25565
+        - Description: rcon
+          CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 25575
+          ToPort: 25575
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  instanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        -
+          PolicyName: s3-sqs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:GetObjectAcl
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${bucket}
+                  - !Sub arn:aws:s3:::${bucket}/*
+
+  instanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref instanceRole
+
+  launchConfiguration:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      AssociatePublicIpAddress: true
+      IamInstanceProfile: !Ref instanceProfile
+      InstanceMonitoring: false
+      SecurityGroups:
+        - !Ref securityGroup
+      KeyName: !Ref KeyPair
+      SpotPrice: !Ref SpotPrice
+      UserData: !Base64
+        "Fn::Sub":
+            - |
+                #!/bin/bash
+
+                yum update -y
+                yum install -y java-1.8.0-openjdk-headless.x86_64
+
+                mkdir -p /opt/minecraft
+                cd /opt/minecraft
+                wget ${url}
+                echo "eula=true" > eula.txt
+
+                # write startup script
+                cat > /opt/minecraft/start.sh <<'EOF'
+                #!/bin/sh
+                if [ ! -z "${subdomain}" ] && [ ! -z "${token}" ]; then
+                  curl -L https://duckdns.org/update/${subdomain}/${token}
+                fi
+                MC_HEAP=`free -m |grep Mem | awk '{if ($2/2 >31744) print 31744; else print int($2/2+0.5);}'`
+                java -Xmx${!MC_HEAP}M -Xms${!MC_HEAP}M -jar server.jar nogui
+                EOF
+
+                chmod 755 /opt/minecraft/start.sh
+
+                # write backup script
+                cat > /opt/minecraft/backup.sh <<'EOF'
+                #!/bin/sh
+                cd /opt/minecraft
+                zip -r - world | aws s3 cp - s3://${bucket}/world.zip
+                aws s3 cp ops.json s3://${bucket}/ops.json
+                aws s3 cp whitelist.json s3://${bucket}/whitelist.json
+                EOF
+
+                chmod 755 /opt/minecraft/backup.sh
+
+                # write restore script
+                cat > /opt/minecraft/restore.sh <<'EOF'
+                #!/bin/sh
+                cd /opt/minecraft
+                rm -rf world/*
+                aws s3 cp s3://${bucket}/world.zip world.zip
+                aws s3 cp s3://${bucket}/ops.json ops.json
+                aws s3 cp s3://${bucket}/whitelist.json whitelist.json
+                unzip world.zip
+                rm -f world.zip
+                EOF
+
+                chmod 755 /opt/minecraft/restore.sh
+
+                # write service definition
+                cat > /etc/systemd/system/minecraft.service <<EOF
+                [Unit]
+                Description=Minecraft Server
+                After=network.target
+
+                [Service]
+                Type=forked
+                WorkingDirectory=/opt/minecraft
+                PIDFile=/opt/minecraft/service.pid
+                ExecStartPre=/usr/bin/rm -f /opt/minecraft/service.pid
+                ExecStartPre=/opt/minecraft/restore.sh
+                ExecStart=/opt/minecraft/start.sh
+                ExecStopPost=/opt/minecraft/backup.sh
+                KillSignal=SIGTERM
+
+                [Install]
+                WantedBy=multi-user.target
+                EOF
+
+                # write initial server config
+                cat > /opt/minecraft/server.properties <<'EOF'
+                server.port=25565
+                enable-rcon=true
+                rcon.password=${AdminPassword}
+                rcon.port=25575
+                motd=${motd}
+                level-seed=${seed}
+                level-type=${type}
+                EOF
+
+                systemctl start minecraft
+            -
+                motd: !Ref MOTD
+                url: !Ref ServerDownloadUrl
+                subdomain: !Ref DuckDnsSubDomain
+                token: !Ref DuckDnsToken
+                seed: !Ref Seed
+                type: !Ref LevelType
+
+  autoscalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+        VPCZoneIdentifier:
+            - !Ref subnet
+        LaunchConfigurationName: !Ref launchConfiguration
+        MinSize: 0
+        MaxSize: 1
+        DesiredCapacity: 1
+        Cooldown: 60
+        Tags:
+            - 
+                Key: Name
+                Value: !Ref AWS::StackName
+                PropagateAtLaunch: true
+
+  lambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - 
+            Effect: Allow
+            Principal:
+                Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - 
+          PolicyName: autoscaling
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:UpdateAutoScalingGroup
+                  - lambda:ListFunctions
+                  - lambda:InvokeFunction
+                Resource: "*"
+
+  rconLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-rcon
+      Handler: index.handler
+      Runtime: nodejs8.10
+      Role: !GetAtt lambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: >
+          const { createConnection } = require('net');
+
+          exports.handler = async (event) => {
+              
+              var rc = new RCON({host:event.host,port:event.port || 25575});
+              var r = "";
+
+              return rc.connect()
+                  .then(() => rc.auth(event.password))
+                  .then(() => r = rc.exec(event.command))
+                  .then(() => rc.disconnect())
+                  .then(() => r);
+          };
+
+          const Prot = {
+              SRVDATA_AUTH: 3,
+              SRVDATA_EXECCOMMAND: 2,
+              SRVDATA_AUTH_RESPONSE: 2,
+              SRVDATA_RESPONSE_VALUE: 0,
+              ID_AUTH: 0x999,
+              ID_REQUEST: 0x123
+          };
+
+          const Packet = {
+              enc: (type, id, body, encoding = 'ascii') =>
+              {
+                const sz = Buffer.byteLength(body) + 14, b = Buffer.alloc(sz);
+                b.writeInt32LE(sz - 4, 0);
+                b.writeInt32LE(id, 4);
+                b.writeInt32LE(type, 8);
+                b.write(body, 12, sz - 2, encoding);
+                b.writeInt16LE(0, sz - 2);
+                return b;
+              },
+              dec: (buf, encoding = 'ascii') =>
+              {
+                return {
+                  size: buf.readInt32LE(0),
+                  id: buf.readInt32LE(4),
+                  type: buf.readInt32LE(8),
+                  body: buf.toString(encoding, 12, buf.byteLength - 2)
+                };
+              }
+          };
+
+          class RCON {
+            constructor(opts = {}) {
+              this.host = opts.host;
+              this.port = opts.port || 27015;
+              this.maximumPacketSize = opts.maximumPacketSize || 4096;
+              this.encoding = opts.encoding || 'ascii';
+              this.timeout = opts.timeout || 1000;
+              this.conn = false;
+              this.connected = false;
+              this.authd = false;
+            }
+
+            connect() {
+              return new Promise((res, rej) => {
+                this.conn = createConnection({ host: this.host, port: this.port }, () => {
+                  this.conn.removeListener('error', rej);
+                  this.connected = true;
+                  res();
+                });
+
+                this.conn.once('error', rej);
+                this.conn.setTimeout(this.timeout);
+              });
+            }
+
+            auth(password) {
+              return new Promise((res, rej) => {
+                if (!this.connected)
+                  rej(Error('Not connected'));
+                if (this.authd)
+                  rej(Error('Already authenticated'));
+                this.write(Prot.SRVDATA_AUTH, Prot.ID_AUTH, password)
+                  .then((data) => {
+                    if (data.id === Prot.ID_AUTH) {
+                      this.authd = true;
+                      res();
+                    } else {
+                      this.disconnect();
+                      rej(Error('Unable to auth'));
+                    }
+                  })
+                  .catch(rej);
+              });
+            }
+
+            disconnect() {
+              this.authd = false;
+              this.connected = false;
+              this.conn.destroy();
+
+              return new Promise((res, rej) => {
+                const onClose = () => {
+                  this.conn.removeListener('error', onError);
+                  res();
+                };
+                const onError = e => {
+                  this.conn.removeListener('close', onClose);
+                  rej(e);
+                };
+                this.conn.once('close', onClose);
+                this.conn.once('error', onError);
+              });
+            }
+
+            write(type, id, body) {
+              return new Promise((res, rej) => {
+                const onData = packet => {
+                  const decodedPacket = Packet.dec(packet, this.encoding);
+
+                  if (type === Prot.SRVDATA_AUTH && decodedPacket.type !== Prot.SRVDATA_AUTH_RESPONSE)
+                    return;
+
+                  this.conn.removeListener('error', onError);
+                  res(decodedPacket);
+                };
+
+                const onError = e => {
+                  this.conn.removeListener('data', onData);
+                  rej(e);
+                };
+
+                const encPkt = Packet.enc(type, id, body, this.encoding);
+
+                if (this.maximumPacketSize > 0 && encPkt.length > this.maximumPacketSize)
+                  rej(Error('Packet too long'));
+
+                this.conn.on('data', onData);
+                this.conn.once('error', onError);
+                this.conn.write(encPkt);
+              });
+            }
+
+            exec(command) {
+              return new Promise((res, rej) => {
+                if (!this.conn.writable)
+                  rej(Error('Unable to write to socket'));
+
+                if (!this.connected)
+                  rej(Error('Not connected'));
+
+                if (!this.authd)
+                  rej(Error('Not authorized'));
+
+                this.write(Prot.SRVDATA_EXECCOMMAND, Prot.ID_REQUEST, command, this.encoding)
+                  .then(data => res(data.body.replace(/\n$/, '')))
+                  .catch(rej);
+              });
+            }
+          }
+
+  lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref AWS::StackName
+      Handler: index.handler
+      Runtime: nodejs8.10
+      Role: !GetAtt lambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          PWD: !Ref AdminPassword
+          GROUP: !Ref autoscalingGroup
+          DOMAIN: !Sub ${DuckDnsSubDomain}.duckdns.org
+      Code:
+        ZipFile: !Sub |
+          var AWS = require('aws-sdk');
+
+          exports.handler = async (event, context, callback) => {
+            
+            console.log("EVENT", JSON.stringify(event));
+            
+            const html = (res) => callback(null, {
+              statusCode: "200",
+              headers: { "Content-Type": "text/html" },
+              body: res
+            });
+            
+            const json = (err, res) => callback(null, {
+                statusCode: err ? '400' : '200',
+                body: JSON.stringify(err ? err : res),
+                headers: {
+                    'Content-Type': "application/json",
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type'
+                },
+            });
+            
+            try {
+              
+              switch (event.httpMethod)
+              {
+                case "OPTIONS": return "";
+                case "GET":
+                  if (event.headers.Accept.indexOf("application/json") != -1)
+                    json(null, await getStatus());
+                  else
+                    html(await getIndex());
+                  break;
+                case "POST":
+                  
+                  var payload = JSON.parse(event.body);
+                  
+                  if (payload.password != process.env.PWD)
+                    throw "Invalid password";
+                  
+                  switch (payload.action)
+                  {
+                    case "start":
+                      await setCapacity(1);
+                      await sleep(1000);
+                      json(null, await getStatus());
+                      break;
+                    case "stop":
+                      await rcon("save-all");
+                      await setCapacity(0);
+                      json(null, await getStatus());
+                      break;
+                    case "rcon":
+                      json(null, await rcon(payload.arg));
+                      break;
+                  }
+            
+                default:
+                  throw "Unsupported";
+              }
+            } catch (e) {
+              console.log("ERROR", JSON.stringify(e));
+              json(e);
+            }
+          };
+
+          async function getIndex() {
+            console.log("Getting index.html");
+            const s3 = new AWS.S3();
+            let res = await s3.getObject({ Bucket: process.env.BUCKET, Key: "index.html" }).promise();
+            console.log("INDEX", JSON.stringify(res));
+            return res.Body.toString();
+          }
+
+          async function getStatus()
+          {
+            const asg = new AWS.AutoScaling();
+            const res = await asg.describeAutoScalingGroups({AutoScalingGroupNames: [process.env.GROUP]}).promise();
+            const group = res.AutoScalingGroups[0];
+            return {
+              domain: process.env.DOMAIN,
+              desired: group.DesiredCapacity,
+              actual: group.Instances.length
+            };
+          }
+
+          async function setCapacity(capacity)
+          {
+            const asg = new AWS.AutoScaling();
+            await asg.updateAutoScalingGroup({ AutoScalingGroupName: process.env.GROUP, DesiredCapacity: capacity }).promise();
+          }
+
+          async function rcon(arg)
+          {
+            console.log("rcon", arg);
+            const lambda = new AWS.Lambda();
+            const res = await lambda.invoke({
+              FunctionName: "vanilla-rcon",
+              InvocationType: "RequestResponse",
+              Payload: JSON.stringify({
+                host: process.env.DOMAIN,
+                port: 25575,
+                password: process.env.PWD,
+                command: arg
+              })
+            }).promise();
+            console.log("RCONRES", JSON.stringify(res));
+            return JSON.parse(res.Payload);
+          }
+
+          const sleep = (milliseconds) => {
+            return new Promise(resolve => setTimeout(resolve, milliseconds))
+          }
+    
+  lambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt lambda.Arn
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${api}/*"
+
+  api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref AWS::StackName
+
+  anyMethod:
+        Type: "AWS::ApiGateway::Method"
+        Properties:
+            AuthorizationType: NONE
+            HttpMethod: ANY
+            RestApiId: !Ref api
+            ResourceId: !GetAtt api.RootResourceId
+            MethodResponses:
+                -
+                    StatusCode: 200
+            Integration:
+                Type: AWS_PROXY
+                IntegrationHttpMethod: POST
+                PassthroughBehavior: WHEN_NO_TEMPLATES
+                Uri: !Sub
+                    - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+                    -
+                        lambdaArn: !GetAtt lambda.Arn
+        DependsOn: lambdaPermission
+
+  deployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref api
+      StageName: DummyStage
+    DependsOn: anyMethod
+
+  stage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref api
+      StageName: handler
+      DeploymentId: !Ref deployment
+
+  s3ObjectWriterRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        -
+          PolicyName: s3-put-delete-object
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                    - 's3:PutObject'
+                    - 's3:DeleteObject'
+                Resource: '*'
+
+  s3ObjectWriter:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-writer
+      Handler: index.handler
+      Runtime: nodejs8.10
+      Role: !GetAtt s3ObjectWriterRole.Arn
+      Timeout: 10
+      Code:
+        ZipFile: >
+          var response = require('cfn-response');
+          var aws = require('aws-sdk');
+          exports.handler = function(event, context) {
+              console.log('EVENT', event);
+              delete event.ResourceProperties.ServiceToken;
+              switch (event.RequestType) {
+                  case 'Create':
+                  case 'Update': handle(putObject, event, context); break;
+                  case 'Delete': handle(deleteObject, event, context); break;
+              }
+          };
+          function handle(func, event, context) {
+              func(event, function(err, result) {
+                  var physicalId = 's3://' + event.ResourceProperties.Bucket + '/' + event.ResourceProperties.Key;
+                  response.send(event, context, err ? 'FAILED' : 'SUCCESS', err || result, physicalId );
+              } );
+          }
+          function putObject(event, callback) {
+              var s3 = new aws.S3();
+              s3.putObject(event.ResourceProperties, callback);
+          }
+          function deleteObject(event, callback) {
+              if (!event.PhysicalResourceId || event.PhysicalResourceId.indexOf('s3://') != 0)
+              {
+              callback(null);
+              }
+              var s3 = new aws.S3();
+              var params = {
+                  Bucket: event.ResourceProperties.Bucket,
+                  Key: event.ResourceProperties.Key
+              };
+              s3.deleteObject(params, callback);
+          }
+
+  indexFile:
+    Type: 'Custom::S3Object'
+    Properties:
+      ServiceToken: !GetAtt s3ObjectWriter.Arn
+      Bucket: !Ref bucket
+      Key: index.html
+      Body: !Sub >
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+          <link rel="stylesheet" href="https://code.getmdl.io/1.3.0/material.indigo-pink.min.css">
+          <style type="text/css">
+              .mdl-layout__header { background-color: rgb(100,128,192); }
+          </style>
+          <script defer src="https://code.getmdl.io/1.3.0/material.min.js"></script>
+          <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+          <script type="text/javascript">
+
+              var host = "https://${api}.execute-api.${AWS::Region}.amazonaws.com/${stage}";
+              var statusTimer = 0;
+              var statusInterval = 0;
+
+              async function setup() {
+                  document.querySelector("#arg").addEventListener("keyup", rconKeyup);
+                  document.querySelector("#power").addEventListener("click", togglePower);
+                  await getStatus();
+              }
+
+              function scheduleStatus(interval) {
+                  if (interval != statusInterval) {
+                      statusInterval = interval;   
+                      if (statusTimer) {
+                          clearInterval(statusTimer);
+                      }
+                      statusTimer = setInterval(getStatus, interval);
+                  }
+              }
+
+              async function command(action, arg) {
+                  spin(true);
+                  let password = document.querySelector("#pwd").value;
+                  try {
+                      let res = await axios.post(host, { action, password, arg });
+                      return res.data;
+                  }
+                  catch (err) {
+                      snack(err.response.data || err);
+                      throw err;
+                  } finally {
+                      spin(false);
+                  }
+              }
+
+              async function togglePower() {
+                  let checked = document.querySelector("#power").checked
+                  try {
+                      let res = await command(checked ? "start" : "stop");
+                      loadStatus(res);
+                      scheduleStatus(5000);
+                  } catch {
+                      setPowerToggle(!checked);
+                  }
+              }
+
+              async function rcon() {
+                  let outEl = document.querySelector("#rconout");
+                  let argEl = document.querySelector("#arg");
+                  let arg = argEl.value;
+
+                  outEl.innerHTML += "> " + arg + "\n";
+                  argEl.value = null;
+                  
+                  let res = await command("rcon", arg);
+                  outEl.innerHTML += "  " + res + "\n\n";
+              }
+
+              async function getStatus() {
+                  spin(true)
+                  try {
+                      let res = await axios.get(host);            
+                      loadStatus(res.data);
+                      scheduleStatus(res.data.desired == res.data.actual ? 60000 : 5000);
+                  } finally {
+                      spin(false);
+                  }
+              }        
+
+              function loadStatus(data) {
+                  document.querySelector("#domain").innerHTML = data.domain;
+                  setPowerToggle(data.desired > 0);
+                  document.querySelector("#status").innerHTML = (data.desired == 0 && data.actual == 0) ? "Offline" : (data.desired > 0 && data.actual == 0) ? "Starting..." : (data.desired == 0 && data.actual > 0) ? "Stopping..." : (data.desired > 0 && data.actual) > 0 ? "Online" : "Unknown";
+              }
+
+              function setPowerToggle(checked) {
+                  if (checked)
+                      document.querySelector("#powerToggle").MaterialSwitch.on();
+                  else
+                      document.querySelector("#powerToggle").MaterialSwitch.off();
+              }
+
+              function snack(message) {
+                  document.querySelector("#snackbar").MaterialSnackbar.showSnackbar({ message });
+              }
+
+              function rconKeyup(ev) {
+                  if (ev.keyCode === 13) {
+                      ev.preventDefault();
+                      rcon();
+                  }
+              }
+
+              function spin(enabled) {
+                  let spinner = document.querySelector("#spinner")
+                  if (enabled)
+                      spinner.classList.add("is-active");
+                  else
+                      spinner.classList.remove("is-active");
+              }
+          </script>
+        </head>
+
+        <body onload="setup()">
+
+            <div class="mdl-layout mdl-js-layout">
+                <header class="mdl-layout__header">
+                    <div class="mdl-layout__header-row">
+                        <i class="material-icons" style="margin-right: 0.5em">dns</i>
+                        <span class="mdl-layout-title">Minecraft Server: <span id="domain"></span></span>
+                        <div style="width: 10em; margin-left: 2em">
+
+                            <label id="powerToggle" class="mdl-switch mdl-js-switch mdl-js-ripple-effect" for="power">
+                                <input type="checkbox" id="power" class="mdl-switch__input">
+                                <span id="status" class="mdl-switch__label">N/A</span>                        
+                            </label>                    
+
+                        </div>
+                        <div id="spinner" class="mdl-spinner mdl-js-spinner"></div>
+                        <div class="mdl-layout-spacer"></div>
+                        <div class="mdl-layout-title"><i class="material-icons" style="margin-right: 0.5em">lock</i></div>
+                        <div class="mdl-textfield mdl-js-textfield">
+                            <input class="mdl-textfield__input" type="password" id="pwd">
+                            <label class="mdl-textfield__label mdl-color-text--white" for="pwd">Password...</label>
+                        </div>
+                    </div>
+                </header>
+                <main class="mdl-layout__content">
+                    <div style="text-align: center">
+
+                        <div><textarea id="rconout" readonly style="width:50vw;height:50vh"></textarea></div>
+
+                        <div class="mdl-textfield mdl-js-textfield" style="width:50vw">
+                            <input class="mdl-textfield__input" type="text" id="arg">
+                            <label class="mdl-textfield__label" for="arg">Command...</label>
+                        </div>
+                    </div>
+
+                </main>
+                <div id="snackbar" class="mdl-js-snackbar mdl-snackbar">
+                    <div class="mdl-snackbar__text"></div>
+                    <button class="mdl-snackbar__action" type="button"></button>
+                </div>
+            </div>
+
+        </body>
